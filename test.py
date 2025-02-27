@@ -10,6 +10,7 @@ import PyPDF2
 from docx import Document
 import asyncio
 from datetime import datetime
+import re
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -151,7 +152,7 @@ def organize_messages_in_batches(messages, batch_size):
     return [messages[i:i+batch_size] for i in range(0, len(messages), batch_size)]
 
 # **📡 Fonction pour envoyer la requête à l'API Claude**
-async def get_claude_response(prompt: str, message_batches: list, specifications: dict, file_content: str, max_batches: int) -> str:
+async def get_claude_response(prompt: str, message_batches: list, specifications: dict, file_content: str, max_batches: int) -> list:
     # Utiliser seulement les derniers lots de messages (jusqu'à max_batches)
     recent_batches = message_batches[-max_batches:] if len(message_batches) > max_batches else message_batches
     
@@ -193,6 +194,9 @@ async def get_claude_response(prompt: str, message_batches: list, specifications
     - Si "Texte": Répondez en texte continu avec des paragraphes.
     - Si "Tableau": Présentez votre réponse sous forme de tableau structuré en utilisant le formatage markdown.
 
+    ### Gestion des réponses longues :
+    Votre réponse doit être complète, peu importe sa longueur. Si votre réponse est très longue, divisez-la en plusieurs parties numérotées (Partie 1/N, Partie 2/N, etc.). Chaque partie doit se terminer par '[SUITE]' si la réponse n'est pas terminée.
+
     ### Exemple d'utilisation :
     {specifications["exemple_cas"]}
 
@@ -205,15 +209,38 @@ async def get_claude_response(prompt: str, message_batches: list, specifications
     """
     
     try:
-        response = client_claude.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=4000,
-            system=system_context,
-            messages=claude_messages
-        )
-        return response.content[0].text
+        responses = []
+        max_chunks = 10  # Augmenté à 10 pour permettre des réponses bien plus longues
+        current_chunk = 1
+        
+        while current_chunk <= max_chunks:
+            # Ajuster le prompt pour les parties suivantes
+            if current_chunk > 1:
+                part_prompt = f"Continuez votre réponse précédente (Partie {current_chunk}/{max_chunks}). Assurez-vous de terminer votre réponse par [SUITE] si elle n'est pas encore complète."
+                claude_messages.append({"role": "user", "content": part_prompt})
+            
+            response = client_claude.messages.create(
+                model="claude-3-5-haiku-20241022",
+                max_tokens=8000,  # Augmenté à 8000 tokens
+                system=system_context,
+                messages=claude_messages
+            )
+            
+            response_text = response.content[0].text
+            responses.append(response_text)
+            
+            # Mettre à jour les messages pour inclure la réponse de Claude
+            claude_messages.append({"role": "assistant", "content": response_text})
+            
+            # Vérifier si la réponse est terminée
+            if "[SUITE]" not in response_text:
+                break
+                
+            current_chunk += 1
+        
+        return responses
     except Exception as e:
-        return f"❌ Erreur lors de l'appel à Claude : {e}"
+        return [f"❌ Erreur lors de l'appel à Claude : {e}"]
 
 # **🚀 Traitement de la requête utilisateur**
 if user_query:
@@ -237,7 +264,7 @@ if user_query:
     )
     
     # Obtenir une réponse de Claude en utilisant les lots de messages
-    response = asyncio.run(get_claude_response(
+    responses = asyncio.run(get_claude_response(
         user_query, 
         st.session_state["message_batches"][:-1],  # Tous les lots sauf celui contenant la dernière requête
         specifications, 
@@ -245,17 +272,30 @@ if user_query:
         max_batches
     ))
 
-    if response:
-        # Afficher et stocker la réponse
-        with st.chat_message("assistant"):
-            st.markdown(response)
-        st.session_state["chat_history"].append({"role": "assistant", "content": response})
+    # Traiter chaque partie de la réponse
+    full_response = ""
+    
+    for i, response_part in enumerate(responses):
+        # Nettoyer le marqueur [SUITE] pour l'affichage
+        clean_response = response_part.replace("[SUITE]", "")
         
-        # Mettre à jour les lots de messages après la réponse
-        st.session_state["message_batches"] = organize_messages_in_batches(
-            st.session_state["chat_history"], 
-            batch_size
-        )
+        # Afficher chaque partie de la réponse
+        with st.chat_message("assistant"):
+            if len(responses) > 1:
+                part_label = f"**Partie {i+1}/{len(responses)}**\n\n"
+                st.markdown(part_label + clean_response)
+            else:
+                st.markdown(clean_response)
+        
+        # Ajouter au chat history
+        st.session_state["chat_history"].append({"role": "assistant", "content": clean_response})
+        full_response += clean_response
+    
+    # Mettre à jour les lots de messages après la réponse
+    st.session_state["message_batches"] = organize_messages_in_batches(
+        st.session_state["chat_history"], 
+        batch_size
+    )
 
     # Déterminer si c'est une continuation d'une conversation existante
     if st.session_state["selected_history_id"]:
@@ -272,7 +312,7 @@ if user_query:
         # Créer une nouvelle entrée d'historique
         history_entry = {
             "query": user_query,
-            "response": response,
+            "response": full_response,  # Stocker la réponse complète
             "timestamp": datetime.now(),
             "descriptif": descriptif,
             "contexte_fonctionnel": contexte_fonctionnel,
