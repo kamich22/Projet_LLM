@@ -204,8 +204,8 @@ async def get_claude_response(prompt: str, message_batches: list, specifications
     
     try:
         response = client_claude.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=8000,
+            model="claude-3-5-haiku-20241022",
+            max_tokens=4000,
             system=system_context,
             messages=claude_messages
         )
